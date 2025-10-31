@@ -1,0 +1,8 @@
+prefix=/home/tong/limx_ws/install
+
+Name: airbot_sdk
+Description: Description of airbot_sdk
+Version: 0.0.1
+Cflags: -I${prefix}/include
+Libs: -L${prefix}/lib 
+Requires: roscpp

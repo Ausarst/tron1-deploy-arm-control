@@ -1,0 +1,1090 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+SoloFoot 无 ROS 低时延几何里程计 + 点云到地面系转换
+
+用途
+    - 直接使用底层 SDK 的 subscribeRobotState 读取关节角(+IMU)，避开 ROS 栈
+    - 内置 SF_TRON1A（SoloFoot）关节几何的快速 FK，基于“支撑足接触约束 + IMU 姿态”反解基底位姿
+    - 从 Realsense (pyrealsense2) 读取深度并生成点云，整体变换到地面系（odom）
+
+适配点
+    - SDK：已直接 import limxsdk（官方风格）；如需自定义导入路径，请在运行环境中正确安装/配置 limxsdk
+  - 相机适配：默认用 pyrealsense2；若你有其它相机/点云源，替换 RealsenseGrabber
+  - 外参与链接名：按你的装配与标定，修改 BASE_TO_CAMERA_* 与链参数
+
+核心公式
+  p^W_base = p^W_contact − R^W_b · p^b_contact
+  其中 R^W_b 由 IMU 四元数直接给出；p^b_contact 由 FK(base->ankle)得到；p^W_contact 为支撑足世界锚点
+
+注意
+  - 本方案不做滤波，不做里程积分，姿态完全来自 IMU，位置由接触约束反解。适合高度场与台阶识别的“旋正到地面系”需求。
+  - 支撑足切换策略这里只做了最简单的按高度判断示例，工程中建议使用接触传感/控制时序/速度阈值。
+"""
+
+from __future__ import annotations
+import os
+import sys
+import time
+import math
+import threading
+from dataclasses import dataclass
+from typing import Dict, Optional, Tuple
+
+import numpy as np
+
+# 可选：ROS 点云（如果你想从 /camera0/depth/color/points 读取）
+try:
+    import rospy
+    from sensor_msgs.msg import PointCloud2
+    import sensor_msgs.point_cloud2 as pc2
+    from std_msgs.msg import Header
+    from visualization_msgs.msg import Marker
+    ROS_AVAILABLE = True
+except Exception:
+    ROS_AVAILABLE = False
+
+# 可选：TF 静态变换，用于让 RViz 识别 Fixed Frame
+try:
+    import tf2_ros
+    from geometry_msgs.msg import TransformStamped
+    TF2_AVAILABLE = True
+except Exception:
+    TF2_AVAILABLE = False
+
+# 直接接入 limxsdk（遵循 tron1-rl-deploy-python 的用法风格）
+try:
+    import limxsdk.robot.Robot as Robot
+    import limxsdk.robot.RobotType as RobotType
+    import limxsdk.datatypes as dt
+except Exception as e:
+    # 有些环境 datatypes 也可能在 limxsdk 下
+    try:
+        import limxsdk.robot.Robot as Robot
+        import limxsdk.robot.RobotType as RobotType
+        from limxsdk import datatypes as dt
+    except Exception as e2:
+        raise ImportError(
+            "未找到 limxsdk，请先安装并确保本环境可导入（pip/whl）。原始错误: {} / {}".format(e, e2)
+        )
+
+# 可选：Realsense 相机
+try:
+    import pyrealsense2 as rs
+    RS_AVAILABLE = True
+except Exception:
+    RS_AVAILABLE = False
+
+
+
+# ============================ 配置区域 ============================
+
+# URDF 中的链参数（取自 SF_TRON1A/urdf/robot_rl.urdf）
+# 左腿各关节的 origin 偏移（父坐标系）
+L_O0 = np.array([0.05556,  0.10500, -0.26020])   # abad_L_Joint origin (base)
+L_O1 = np.array([-0.07700, 0.02050,  0.00000])   # hip_L_Joint origin  (abad)
+L_O2 = np.array([-0.15000,-0.02050, -0.25981])   # knee_L_Joint origin (hip)
+L_O3 = np.array([ 0.15000, 0.00000, -0.25981])   # ankle_L_Joint origin(knee)
+
+# 右腿各关节的 origin 偏移
+R_O0 = np.array([0.05556, -0.10500, -0.26020])   # abad_R_Joint origin (base)
+R_O1 = np.array([-0.07700,-0.02050,  0.00000])   # hip_R_Joint origin  (abad)
+R_O2 = np.array([-0.15000, 0.02050, -0.25981])   # knee_R_Joint origin (hip)
+R_O3 = np.array([ 0.15000, 0.00000, -0.25981])   # ankle_R_Joint origin(knee)
+
+# 关节轴方向（绕轴右手定则）
+# abad: x ；hip/knee/ankle: y（注意部分关节是 -y）
+AXIS_X = np.array([1.0, 0.0, 0.0])
+AXIS_Y = np.array([0.0, 1.0, 0.0])
+AXIS_nY = np.array([0.0,-1.0, 0.0])
+
+# 左腿各关节轴
+L_AXES = [AXIS_X, AXIS_Y, AXIS_nY, AXIS_nY]
+# 右腿各关节轴（hip_R 为 -y，knee_R 为 +y，ankle_R 为 -y）
+R_AXES = [AXIS_X, AXIS_nY, AXIS_Y, AXIS_nY]
+
+# 支撑足默认选择（True=左足，False=右足），可在运行时切换
+DEFAULT_LEFT_STANCE = True
+
+# IMU 姿态来源：True=从 SDK RobotState 获得；False=单位阵（仅测试用）
+IMU_FROM_SDK = True
+# 若 SDK 提供的 IMU 四元数方向与本代码假设相反（例如 base->world 而非 world->base），
+# 可开启该开关对四元数取共轭（等价于取逆）。环境变量 IMU_QUAT_CONJ=1 开启。
+IMU_QUAT_CONJ = bool(int(os.environ.get("IMU_QUAT_CONJ", "0")))
+
+# 可选：IMU 坐标系 -> base 坐标系的固定旋转（用于修正 IMU 传感器安装与 base_link 轴定义不一致的问题）
+# 仅当你的 IMU 四元数方向正确但轴向与 base 不一致时需要设置；默认单位阵不生效。
+# 用法（任选其一）：
+#   IMU_TO_BASE_QUAT="qx,qy,qz,qw"
+#   或 IMU_TO_BASE_RPY="roll,pitch,yaw"（默认度，IMU_TO_BASE_RPY_IS_DEG=1|0）
+IMU_TO_BASE_QUAT_ENV = os.environ.get("IMU_TO_BASE_QUAT", "")
+IMU_TO_BASE_RPY_ENV = os.environ.get("IMU_TO_BASE_RPY", "")
+IMU_TO_BASE_RPY_IS_DEG = bool(int(os.environ.get("IMU_TO_BASE_RPY_IS_DEG", "1")))
+
+# base -> camera 外参（替换为你的标定）。可用环境变量覆盖：
+#   BASE_TO_CAMERA_XYZ="x,y,z"   BASE_TO_CAMERA_QUAT="qx,qy,qz,qw"
+# 注意：如果你的点云话题 frame_id 含 optical（典型 realsense-ros），
+# 则相机点云坐标系是“optical frame”（x右 y下 z前）。此时应将 CAM_FRAME_IS_OPTICAL=1，
+# 脚本会自动在外参后拼接标准 optical 旋转（camera_body -> camera_optical）。
+BASE_TO_CAMERA_XYZ = np.array([0.0, 0.0, 0.465])
+BASE_TO_CAMERA_QUAT = np.array([0.0, 0.0, 0.0, 1.0])  # [qx,qy,qz,qw]
+BASE_TO_CAMERA_RPY_ENV = os.environ.get("BASE_TO_CAMERA_RPY", "")
+BASE_TO_CAMERA_RPY_IS_DEG = bool(int(os.environ.get("BASE_TO_CAMERA_RPY_IS_DEG", "1")))
+# 若未通过环境变量提供外参，使用经过 FORCE 校准验证的默认姿态（单位：度）
+BASE_TO_CAMERA_RPY_DEFAULT_DEG = np.array([90.0, -12.3, 0.0], dtype=np.float64)
+
+# 点云输出（可选保存 PLY，默认只计数）
+SAVE_PLY = False
+PLY_PATH = os.path.join(os.path.dirname(__file__), "points_in_odom.ply")
+
+# 是否通过 ROS 订阅点云（True 优先使用 ROS 的 PointCloud2；False 使用 pyrealsense2 直读）
+USE_ROS_POINTCLOUD = True
+# ROS 点云话题名（例如 RealSense realsense-ros 默认的对齐彩色点云）
+ROS_POINTCLOUD_TOPIC = "/camera0/depth/color/points"
+
+# 强制仅走 ROS 点云，不与设备直连（避免与 realsense-ros 抢占硬件）
+FORCE_ROS_ONLY = True
+
+# ROS 点云采样（降低每帧处理量，避免回调过慢）
+# 可用环境变量覆盖：ROS_CLOUD_STRIDE, ROS_CLOUD_MAX_POINTS
+ROS_CLOUD_STRIDE = int(os.environ.get("ROS_CLOUD_STRIDE", "2"))            # 每隔多少个点取一个（>=1）
+ROS_CLOUD_MAX_POINTS = int(os.environ.get("ROS_CLOUD_MAX_POINTS", "150000"))   # 每帧最多点数上限（防止超大帧）
+
+# 发布频率上限（Hz），避免占用过多 CPU；可用环境变量覆盖 PUBLISH_MAX_HZ
+PUBLISH_MAX_HZ = float(os.environ.get("PUBLISH_MAX_HZ", "10"))
+
+# 主循环最小睡眠时间（秒），可用环境变量覆盖 LOOP_SLEEP_SEC
+LOOP_SLEEP_SEC = float(os.environ.get("LOOP_SLEEP_SEC", "0.01"))
+
+# 是否发布变换后的点云到 ROS，便于在 RViz 中查看（Fixed Frame 设为 ROS_CLOUD_FRAME）
+PUBLISH_ROS_CLOUD = True
+ROS_CLOUD_TOPIC = "/world_base/points"
+ROS_CLOUD_FRAME = "odom"  # RViz 的 Fixed Frame 建议设为同名（如 odom/map/world）
+
+# 如无 TF 树提供 ROS_CLOUD_FRAME，可选地发布一个静态 TF 让 RViz 识别该帧存在
+# 将 STATIC_PARENT_FRAME -> ROS_CLOUD_FRAME 发布为单位变换。
+ENSURE_TF_STATIC = True
+STATIC_PARENT_FRAME = os.environ.get("STATIC_PARENT_FRAME", "world")
+
+# 可选：发布相机帧的动态 TF（ROS_CLOUD_FRAME -> CAMERA_FRAME_ID），便于 RViz 直接订阅原始相机话题
+PUBLISH_CAMERA_TF = bool(int(os.environ.get("PUBLISH_CAMERA_TF", "0")))
+CAMERA_FRAME_ID = os.environ.get("CAMERA_FRAME_ID", "camera0_color_optical_frame")
+
+# RViz 地平面可视化（Marker），默认开启；可通过环境变量关闭
+PUBLISH_GROUND_MARKER = bool(int(os.environ.get("PUBLISH_GROUND_MARKER", "1")))
+GROUND_MARKER_TOPIC = os.environ.get("GROUND_MARKER_TOPIC", "/world_base/ground_marker")
+
+# 调试：强制使用“相机在世界系中的固定位姿”，绕过 IMU/外参估计，便于快速校验
+# FORCE_CAMERA_IN_WORLD=1 时启用；
+#   CAM_WORLD_XYZ="x,y,z"
+#   CAM_WORLD_QUAT="qx,qy,qz,qw" 或 CAM_WORLD_RPY="roll,pitch,yaw"（度或弧度见下）
+FORCE_CAMERA_IN_WORLD = bool(int(os.environ.get("FORCE_CAMERA_IN_WORLD", "0")))
+CAM_WORLD_XYZ_ENV = os.environ.get("CAM_WORLD_XYZ", "0,0,0.465")
+CAM_WORLD_QUAT_ENV = os.environ.get("CAM_WORLD_QUAT", "")
+CAM_WORLD_RPY_ENV = os.environ.get("CAM_WORLD_RPY", "90,-12.3,0")
+CAM_WORLD_RPY_IS_DEG = bool(int(os.environ.get("CAM_WORLD_RPY_IS_DEG", "1")))
+
+# 输入点云是否在“optical frame”（x右 y下 z前）。若是，则需在外参后拼接标准旋转：
+# camera_body -> camera_optical = Rx(+90deg) * Rz(+90deg)
+CAM_FRAME_IS_OPTICAL = bool(int(os.environ.get("CAM_FRAME_IS_OPTICAL", "1")))
+
+# SDK 连接参数 真机改成LIMX_ROBOT_IP=10.192.1.2
+ROBOT_IP = os.environ.get("LIMX_ROBOT_IP", "127.0.0.1")  # 真实机常见为 10.192.1.2
+
+
+# ============================ 工具函数 ============================
+
+def rot_matrix_from_axis_angle(axis: np.ndarray, theta: float) -> np.ndarray:
+    """Rodrigues 公式: 轴向单位向量 axis, 旋转角 theta(rad) -> 3x3 R旋转矩阵"""
+    axis = axis / (np.linalg.norm(axis) + 1e-12)
+    x, y, z = axis
+    c = math.cos(theta)
+    s = math.sin(theta)
+    C = 1 - c
+    Rm = np.array([
+        [c + x*x*C,     x*y*C - z*s, x*z*C + y*s],
+        [y*x*C + z*s,   c + y*y*C,   y*z*C - x*s],
+        [z*x*C - y*s,   z*y*C + x*s, c + z*z*C  ]
+    ], dtype=np.float64)
+    return Rm
+
+
+def quat_to_rotmat(q: np.ndarray) -> np.ndarray:
+    """四元数 [qx,qy,qz,qw] -> 3x3 R旋转矩阵"""
+    qx, qy, qz, qw = q
+    # 归一化
+    n = math.sqrt(qx*qx + qy*qy + qz*qz + qw*qw) + 1e-12
+    qx, qy, qz, qw = qx/n, qy/n, qz/n, qw/n
+    xx, yy, zz = qx*qx, qy*qy, qz*qz
+    xy, xz, yz = qx*qy, qx*qz, qy*qz
+    wx, wy, wz = qw*qx, qw*qy, qw*qz
+    Rm = np.array([
+        [1-2*(yy+zz), 2*(xy-wz),   2*(xz+wy)],
+        [2*(xy+wz),   1-2*(xx+zz), 2*(yz-wx)],
+        [2*(xz-wy),   2*(yz+wx),   1-2*(xx+yy)]
+    ], dtype=np.float64)
+    return Rm
+
+
+def rotmat_to_quat(R: np.ndarray) -> np.ndarray:
+    """3x3 旋转矩阵 -> 四元数 [qx,qy,qz,qw]"""
+    m00, m01, m02 = R[0, 0], R[0, 1], R[0, 2]
+    m10, m11, m12 = R[1, 0], R[1, 1], R[1, 2]
+    m20, m21, m22 = R[2, 0], R[2, 1], R[2, 2]
+
+    trace = m00 + m11 + m22
+    if trace > 0.0:
+        s = math.sqrt(trace + 1.0) * 2.0
+        qw = 0.25 * s
+        qx = (m21 - m12) / s
+        qy = (m02 - m20) / s
+        qz = (m10 - m01) / s
+    elif (m00 > m11) and (m00 > m22):
+        s = math.sqrt(1.0 + m00 - m11 - m22) * 2.0
+        qw = (m21 - m12) / s
+        qx = 0.25 * s
+        qy = (m01 + m10) / s
+        qz = (m02 + m20) / s
+    elif m11 > m22:
+        s = math.sqrt(1.0 + m11 - m00 - m22) * 2.0
+        qw = (m02 - m20) / s
+        qx = (m01 + m10) / s
+        qy = 0.25 * s
+        qz = (m12 + m21) / s
+    else:
+        s = math.sqrt(1.0 + m22 - m00 - m11) * 2.0
+        qw = (m10 - m01) / s
+        qx = (m02 + m20) / s
+        qy = (m12 + m21) / s
+        qz = 0.25 * s
+
+    q = np.array([qx, qy, qz, qw], dtype=np.float64)
+    # 归一化
+    n = np.linalg.norm(q)
+    if n > 0:
+        q /= n
+    return q
+
+
+def make_T(Rm: np.ndarray, t: np.ndarray) -> np.ndarray:
+    """由 3x3 旋转矩阵 Rm 和 3x1 平移向量 t 构造 4x4 齐次矩阵 T"""
+    T = np.eye(4, dtype=np.float64)
+    T[:3, :3] = Rm
+    T[:3, 3] = t
+    return T
+
+
+def transform_points(T: np.ndarray, pts: np.ndarray) -> np.ndarray:
+    """将 Nx3 点集用 4x4 齐次矩阵 T 变换"""
+    N = pts.shape[0]
+    homo = np.hstack([pts, np.ones((N,1), dtype=pts.dtype)])
+    out = (T @ homo.T).T
+    return out[:, :3]
+
+
+def _load_imu_to_base_rot() -> np.ndarray:
+    """从环境变量加载 IMU->base 的固定旋转，未设置则返回单位阵。"""
+    # 优先 QUAT
+    q = _parse_vec_env("IMU_TO_BASE_QUAT", 4)
+    if (q is None) and IMU_TO_BASE_QUAT_ENV:
+        try:
+            parts = [p.strip() for p in IMU_TO_BASE_QUAT_ENV.split(',') if p.strip()]
+            if len(parts) == 4:
+                q = np.array([float(x) for x in parts], dtype=np.float64)
+        except Exception:
+            q = None
+    if q is not None:
+        return quat_to_rotmat(q)
+
+    # 再尝试 RPY
+    rpy = _parse_vec_env("IMU_TO_BASE_RPY", 3)
+    if (rpy is None) and IMU_TO_BASE_RPY_ENV:
+        try:
+            parts = [p.strip() for p in IMU_TO_BASE_RPY_ENV.split(',') if p.strip()]
+            if len(parts) == 3:
+                vals = [float(x) for x in parts]
+                if IMU_TO_BASE_RPY_IS_DEG:
+                    vals = [math.radians(v) for v in vals]
+                rpy = vals
+        except Exception:
+            rpy = None
+    if rpy is not None:
+        return rpy_to_rotmat(rpy[0], rpy[1], rpy[2])
+
+    return np.eye(3, dtype=np.float64)
+
+
+def _parse_vec_env(name: str, n: int):
+    """从环境变量读取逗号分隔的向量（长度 n），失败则返回 None。"""
+    try:
+        s = os.environ.get(name, None)
+        if not s:
+            return None
+        parts = [p.strip() for p in s.split(',')]
+        if len(parts) != n:
+            return None
+        vals = np.array([float(x) for x in parts], dtype=np.float64)
+        return vals
+    except Exception:
+        return None
+
+
+def fit_plane_pca(pts: np.ndarray) -> tuple[np.ndarray, float]:
+    """对点集拟合平面，返回 (法向量 n，平面常数 d)，使得 n·x + d = 0。
+    使用 PCA（最小特征值对应的特征向量为法向量）。
+    """
+    if pts.shape[0] < 3:
+        return np.array([0,0,1], dtype=np.float64), 0.0
+    ctr = np.mean(pts, axis=0)
+    Q = pts - ctr
+    H = (Q.T @ Q) / max(1, pts.shape[0]-1)
+    # 最小特征值对应特征向量
+    w, v = np.linalg.eigh(H)
+    n = v[:, 0]
+    # 统一方向：朝向 +Z
+    if n[2] < 0:
+        n = -n
+    d = -float(n.dot(ctr))
+    return n.astype(np.float64), d
+
+
+def rpy_to_rotmat(roll: float, pitch: float, yaw: float) -> np.ndarray:
+    """按 Z-Y-X (yaw-pitch-roll) 生成旋转矩阵。"""
+    cr, sr = math.cos(roll), math.sin(roll)
+    cp, sp = math.cos(pitch), math.sin(pitch)
+    cy, sy = math.cos(yaw), math.sin(yaw)
+    Rz = np.array([[cy, -sy, 0], [sy, cy, 0], [0, 0, 1]], dtype=np.float64)
+    Ry = np.array([[cp, 0, sp], [0, 1, 0], [-sp, 0, cp]], dtype=np.float64)
+    Rx = np.array([[1, 0, 0], [0, cr, -sr], [0, sr, cr]], dtype=np.float64)
+    return (Rz @ Ry) @ Rx
+
+
+# ============================ Forward Kinematics (FK) ============================
+
+def fk_base_to_ankle_left(q_abad: float, q_hip: float, q_knee: float, q_ankle: float) -> Tuple[np.ndarray, np.ndarray]:
+    """base -> ankle_L_Link 的 FK
+    返回: (p_b_ankle[3], R_b_ankle[3x3])
+    """
+    # T0 = Trans(O0) * Rot(axis_x, q_abad)
+    R0 = rot_matrix_from_axis_angle(L_AXES[0], q_abad)
+    T0 = make_T(R0, L_O0)
+    # T1 = Trans(O1) * Rot(+y, q_hip)
+    R1 = rot_matrix_from_axis_angle(L_AXES[1], q_hip)
+    T1 = make_T(R1, L_O1)
+    # T2 = Trans(O2) * Rot(-y, q_knee)
+    R2 = rot_matrix_from_axis_angle(L_AXES[2], q_knee)
+    T2 = make_T(R2, L_O2)
+    # T3 = Trans(O3) * Rot(-y, q_ankle)
+    R3 = rot_matrix_from_axis_angle(L_AXES[3], q_ankle)
+    T3 = make_T(R3, L_O3)
+
+    T = (((T0 @ T1) @ T2) @ T3)
+    p = T[:3, 3].copy()
+    Rm = T[:3, :3].copy()
+    return p, Rm
+
+
+def fk_base_to_ankle_right(q_abad: float, q_hip: float, q_knee: float, q_ankle: float) -> Tuple[np.ndarray, np.ndarray]:
+    """base -> ankle_R_Link 的 FK（右腿轴向与左腿略有符号差异）"""
+    R0 = rot_matrix_from_axis_angle(R_AXES[0], q_abad)
+    T0 = make_T(R0, R_O0)
+    R1 = rot_matrix_from_axis_angle(R_AXES[1], q_hip)
+    T1 = make_T(R1, R_O1)
+    R2 = rot_matrix_from_axis_angle(R_AXES[2], q_knee)
+    T2 = make_T(R2, R_O2)
+    R3 = rot_matrix_from_axis_angle(R_AXES[3], q_ankle)
+    T3 = make_T(R3, R_O3)
+
+    T = (((T0 @ T1) @ T2) @ T3)
+    p = T[:3, 3].copy()
+    Rm = T[:3, :3].copy()
+    return p, Rm
+
+
+# ============================== SDK 接入（limxsdk） =================================
+
+@dataclass
+class RobotState:
+    # 关节角（弧度）
+    q_abad_L: float = 0.0
+    q_hip_L: float = 0.0
+    q_knee_L: float = 0.0
+    q_ankle_L: float = 0.0
+    q_abad_R: float = 0.0
+    q_hip_R: float = 0.0
+    q_knee_R: float = 0.0
+    q_ankle_R: float = 0.0
+    # IMU 四元数（世界->base），顺序 [qx,qy,qz,qw]
+    imu_q: np.ndarray = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
+
+
+class RobotSDKWrapper:
+    """基于 limxsdk 的实时订阅封装（官方主节点风格）。
+    使用方法：
+      sdk = RobotSDKWrapper()
+      sdk.start(on_state)
+      ...
+        行为：
+            - 官方导入风格：`import limxsdk.robot.Robot as Robot`，`import limxsdk.robot.RobotType as RobotType`。
+            - 根据环境变量 ROBOT_TYPE 选择 SDK RobotType：
+                    以 "SF" 开头 -> SoloFoot（若无该枚举则回退 BipedFoot）
+                    以 "PF" 开头 -> PointFoot（无踝）
+                    以 "WF" 开头 -> WheelFoot（若 SDK 提供）
+                未设置时默认 SoloFoot（若无则回退 BipedFoot，再回退 PointFoot）。
+      - 订阅 ImuData 与 RobotState，并回调上层 on_state_cb。
+    """
+    def __init__(self):
+        self._on_state_cb = None
+        self._imu_quat = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
+        self._robot = None
+
+    def start(self, on_state_cb):
+        self._on_state_cb = on_state_cb
+
+        # 根据 ROBOT_TYPE 选择优先级；同时提供健壮回退到 PointFoot
+        env_rt = os.environ.get("ROBOT_TYPE", "").upper().strip()
+        if env_rt.startswith("SF"):
+            pref_names = ('SoloFoot', 'PointFoot', 'BipedFoot')
+        elif env_rt.startswith("WF"):
+            pref_names = ('WheelFoot', 'PointFoot', 'SoloFoot', 'BipedFoot')
+        elif env_rt.startswith("PF"):
+            pref_names = ('PointFoot', 'SoloFoot', 'BipedFoot')
+        else:
+            pref_names = ('PointFoot', 'SoloFoot', 'BipedFoot')
+
+        candidates = [getattr(RobotType, n, None) for n in pref_names]
+        candidates = [c for c in candidates if c is not None]
+        if not candidates:
+            raise RuntimeError("RobotType 列表为空，请检查 limxsdk 安装是否完整")
+
+        last_err = None
+        self._robot = None
+        for t in candidates:
+            try:
+                rob = Robot(t)
+                self._robot = rob
+                break
+            except Exception as e:
+                last_err = e
+                self._robot = None
+                continue
+        if self._robot is None:
+            raise RuntimeError(f"无法创建 Robot 实例，错误: {last_err}")
+
+        # 获取机器人IP
+        ip = os.environ.get("LIMX_ROBOT_IP", ROBOT_IP)
+        if len(sys.argv) > 1:
+            ip = sys.argv[1]
+        # 初始化连接（个别版本若抛出 AttributeError: 'Robot' has no attribute 'robot'，
+        # 说明底层对象未创建成功，尝试再次通过工厂方式创建一次）
+        ok = False
+        init_errors = []
+        # 先用当前实例尝试
+        try:
+            ok = bool(self._robot.init(ip))
+        except Exception as e:
+            init_errors.append(str(e))
+            ok = False
+        # 若失败，尝试其它候选类型
+        if not ok and len(candidates) > 1:
+            for t in candidates[1:]:
+                try:
+                    rob = Robot(t)
+                    if rob.init(ip):
+                        self._robot = rob
+                        ok = True
+                        break
+                except Exception as e:
+                    init_errors.append(str(e))
+                    continue
+        if not ok:
+            raise RuntimeError(f"limxsdk 连接失败，IP={ip}，尝试类型={pref_names}，错误={init_errors}")
+
+        # IMU 回调（提供 [x,y,z,w]）
+        def _imu_cb(imu: dt.ImuData):
+            # 确保为 numpy 数组
+            try:
+                q = np.array(imu.quat, dtype=np.float64)
+                if q.shape[0] == 4:
+                    self._imu_quat = q
+            except Exception:
+                pass
+
+        # 关节状态回调（映射到本模块 RobotState）
+        def _state_cb(rs: dt.RobotState):
+            try:
+                q = list(rs.q)
+            except Exception:
+                q = []
+            n = len(q)
+            if n >= 8:
+                # SoloFoot/BipedFoot: [L0,L1,L2,L3, R0,R1,R2,R3]
+                qL0, qL1, qL2, qL3 = q[0], q[1], q[2], q[3]
+                qR0, qR1, qR2, qR3 = q[4], q[5], q[6], q[7]
+            elif n >= 6:
+                # PointFoot: [L0,L1,L2, R0,R1,R2]，无踝，踝角置 0
+                qL0, qL1, qL2, qL3 = q[0], q[1], q[2], 0.0
+                qR0, qR1, qR2, qR3 = q[3], q[4], q[5], 0.0
+            else:
+                # 数据不足，跳过
+                return
+
+            st = RobotState(
+                q_abad_L=float(qL0), q_hip_L=float(qL1), q_knee_L=float(qL2), q_ankle_L=float(qL3),
+                q_abad_R=float(qR0), q_hip_R=float(qR1), q_knee_R=float(qR2), q_ankle_R=float(qR3),
+                imu_q=self._imu_quat.copy()
+            )
+            if self._on_state_cb:
+                self._on_state_cb(st)
+
+        # 订阅
+        self._robot.subscribeImuData(_imu_cb)
+        self._robot.subscribeRobotState(_state_cb)
+
+    def stop(self):
+        # 当前 SDK Python 绑定未提供统一关闭接口，保留占位
+        self._robot = None
+
+
+# ============================ 相机（Realsense） ============================
+
+class RealsenseGrabber:
+    def __init__(self, use_color: bool=False):
+        if not RS_AVAILABLE:
+            raise RuntimeError("pyrealsense2 未安装，无法抓取点云。请安装 librealsense2-python 或自行替换相机接口。")
+        self.pipe = rs.pipeline()
+        cfg = rs.config()
+        cfg.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
+        if use_color:
+            cfg.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+        self.profile = self.pipe.start(cfg)
+        self.pc = rs.pointcloud()
+        self.align = rs.align(rs.stream.depth)
+
+    def get_points_xyz(self) -> Tuple[np.ndarray, float]:
+        frames = self.pipe.wait_for_frames()
+        frames = self.align.process(frames)
+        depth = frames.get_depth_frame()
+        if not depth:
+            return np.zeros((0,3), dtype=np.float32), time.time()
+        pts = self.pc.calculate(depth)
+        v = np.asanyarray(pts.get_vertices())  # Nx1 的结构数组，包含 (x,y,z)
+        xyz = np.asarray([(p[0], p[1], p[2]) for p in v], dtype=np.float32)
+        ts = time.time()
+        return xyz, ts
+
+    def stop(self):
+        self.pipe.stop()
+
+
+# ============================ 相机（ROS PointCloud2） ============================
+
+class RosPointCloudGrabber:
+    """通过 ROS 订阅 PointCloud2 点云（不走 pyrealsense2），默认订阅 /camera0/depth/color/points。
+    注意：需要在运行环境中可用 rospy 与 sensor_msgs。
+    """
+    def __init__(self, topic: str = "/camera0/depth/color/points"):
+        if not ROS_AVAILABLE:
+            raise RuntimeError("ROS 未安装或不可用，无法订阅 PointCloud2。请安装 rospy/sensor_msgs 或关闭 USE_ROS_POINTCLOUD。")
+        # 要求外部先初始化 ROS 节点，避免匿名节点残留难以清理
+        if not rospy.core.is_initialized():
+            raise RuntimeError("ROS 节点未初始化，请在创建订阅前先调用 rospy.init_node('world_base')。")
+        self._topic = topic
+        self._latest_xyz: Optional[np.ndarray] = None
+        self._latest_ts: float = 0.0
+        self._lock = threading.Lock()
+        self._sub = rospy.Subscriber(self._topic, PointCloud2, self._cb, queue_size=1)
+        self._printed_frame = False
+
+    def _cb(self, msg: PointCloud2):
+        try:
+            if not self._printed_frame:
+                try:
+                    rospy.loginfo(f"[SoloFoot] ROS 点云 frame_id: {msg.header.frame_id}")
+                except Exception:
+                    print(f"[SoloFoot] ROS 点云 frame_id: {getattr(msg.header, 'frame_id', '')}")
+                self._printed_frame = True
+            # 读取 x,y,z 字段（跳过 NaN），并进行轻量采样
+            pts_iter = pc2.read_points(msg, field_names=("x", "y", "z"), skip_nans=True)
+            stride = max(1, int(ROS_CLOUD_STRIDE))
+            max_pts = max(1, int(ROS_CLOUD_MAX_POINTS))
+            buf = []
+            for i, p in enumerate(pts_iter):
+                if (i % stride) != 0:
+                    continue
+                buf.append((float(p[0]), float(p[1]), float(p[2])))
+                if len(buf) >= max_pts:
+                    break
+            xyz = np.asarray(buf, dtype=np.float32)
+            with self._lock:
+                # 存入数据
+                self._latest_xyz = xyz
+                # 存入时间戳，转为浮点秒
+                self._latest_ts = msg.header.stamp.to_sec() if hasattr(msg.header.stamp, 'to_sec') else time.time()
+        except Exception:
+            pass
+
+    def get_points_xyz(self) -> Tuple[np.ndarray, float]:
+        with self._lock:
+            if self._latest_xyz is None:
+                return np.zeros((0, 3), dtype=np.float32), time.time()
+            return self._latest_xyz.copy(), float(self._latest_ts)
+
+    def stop(self):
+        try:
+            if self._sub is not None:
+                self._sub.unregister()
+        except Exception:
+            pass
+
+
+# ============================ 基底位姿估计（接触约束） ============================
+
+class WorldEstimator:
+    def __init__(self):
+        self.left_stance = DEFAULT_LEFT_STANCE
+        self._inited_stance = False
+        self.pW_contact_L: Optional[np.ndarray] = None
+        self.pW_contact_R: Optional[np.ndarray] = None
+        self.RW_b = np.eye(3, dtype=np.float64)
+        self.pW_base = np.zeros(3, dtype=np.float64)
+        self.TW_b = make_T(self.RW_b, self.pW_base)
+        # IMU 轴向到 base 轴向的固定修正
+        self.R_imu_to_base = _load_imu_to_base_rot()
+
+    def update_imu(self, imu_q: np.ndarray):
+        q = imu_q.astype(np.float64)
+        if IMU_QUAT_CONJ:
+            # 共轭：[-x,-y,-z,w]，相当于求逆
+            q = np.array([-q[0], -q[1], -q[2], q[3]], dtype=np.float64)
+        # 先将 IMU 姿态转为旋转矩阵，再右乘一个固定的 IMU->base 校正
+        # 若你的 IMU 四元数本就表达 world->base，则将 R_imu_to_base 设为单位阵即可（默认）。
+        Rw_sensor = quat_to_rotmat(q)
+        self.RW_b = Rw_sensor @ self.R_imu_to_base
+
+    def compute(self, state: RobotState) -> np.ndarray:
+        # 1) FK：得到 base 下的足端位置
+        pL_b, _ = fk_base_to_ankle_left(state.q_abad_L, state.q_hip_L, state.q_knee_L, state.q_ankle_L)
+        pR_b, _ = fk_base_to_ankle_right(state.q_abad_R, state.q_hip_R, state.q_knee_R, state.q_ankle_R)
+
+        # 2) 初始化世界系接触锚点（上电静止时，可视为 pW_contact = R^W_b * p^b_contact）
+        if self.pW_contact_L is None:
+            self.pW_contact_L = pL_b
+        if self.pW_contact_R is None:
+            self.pW_contact_R = pR_b
+
+        # 3) 选择支撑足（示例：谁的世界 z 更低谁是支撑足；实际建议用接触传感/控制时序）
+        zL = (pL_b)[2]
+        zR = (pR_b)[2]
+        new_left = (zL < zR)  # 左更低则选左
+        # 在支撑切换瞬间，重置对应足的世界锚点以保持位姿连续
+        if self._inited_stance:
+            if new_left != self.left_stance:
+                self.switch_stance_anchor(new_left, state)
+        else:
+            self._inited_stance = True
+        self.left_stance = new_left
+
+        if self.left_stance:
+            pW_contact = self.pW_contact_L
+            p_contact_b = pL_b
+        else:
+            pW_contact = self.pW_contact_R
+            p_contact_b = pR_b
+
+        # 4) 反解基底位置
+        self.pW_base = pW_contact - (p_contact_b)
+        self.TW_b = make_T(self.RW_b, self.pW_base)
+        return self.TW_b
+
+    def switch_stance_anchor(self, use_left: bool, state: RobotState):
+        """支撑切换时，重置新的世界锚点以保证位姿连续"""
+        self.left_stance = bool(use_left)
+        if self.left_stance:
+            pL_b, _ = fk_base_to_ankle_left(state.q_abad_L, state.q_hip_L, state.q_knee_L, state.q_ankle_L)
+            self.pW_contact_L = self.pW_base + (pL_b)
+        else:
+            pR_b, _ = fk_base_to_ankle_right(state.q_abad_R, state.q_hip_R, state.q_knee_R, state.q_ankle_R)
+            self.pW_contact_R = self.pW_base + (pR_b)
+
+
+# ============================ 主流程 ============================
+
+def save_ply_xyz(path: str, pts: np.ndarray):
+    with open(path, 'wb') as f:
+        header = """ply
+format ascii 1.0
+element vertex %d
+property float x
+property float y
+property float z
+end_header
+""" % pts.shape[0]
+        f.write(header.encode('utf-8'))
+        for p in pts:
+            f.write(f"{p[0]} {p[1]} {p[2]}\n".encode('utf-8'))
+
+
+def main():
+    print("[SoloFoot] 无ROS 低时延几何里程计 + 点云变换 启动")
+
+    # base->camera 外参
+    _xyz_override = _parse_vec_env("BASE_TO_CAMERA_XYZ", 3)
+    _quat_override = _parse_vec_env("BASE_TO_CAMERA_QUAT", 4)
+    _rpy_override = _parse_vec_env("BASE_TO_CAMERA_RPY", 3) if _quat_override is None else None
+    xyz_bc = (_xyz_override if _xyz_override is not None else BASE_TO_CAMERA_XYZ).astype(np.float64)
+    if _quat_override is not None:
+        Rb_c = quat_to_rotmat(_quat_override.astype(np.float64))
+    elif _rpy_override is not None:
+        vals = _rpy_override.astype(np.float64)
+        if BASE_TO_CAMERA_RPY_IS_DEG:
+            vals = np.array([math.radians(v) for v in vals], dtype=np.float64)
+        Rb_c = rpy_to_rotmat(vals[0], vals[1], vals[2])
+    else:
+        # 回退到经过实测验证的默认 RPY（90, -12.3, 0）
+        _rads = np.array([math.radians(BASE_TO_CAMERA_RPY_DEFAULT_DEG[0]),
+                          math.radians(BASE_TO_CAMERA_RPY_DEFAULT_DEG[1]),
+                          math.radians(BASE_TO_CAMERA_RPY_DEFAULT_DEG[2])], dtype=np.float64)
+        Rb_c = rpy_to_rotmat(_rads[0], _rads[1], _rads[2])
+        try:
+            print(f"[SoloFoot] 使用默认 BASE_TO_CAMERA_RPY(deg)={BASE_TO_CAMERA_RPY_DEFAULT_DEG.tolist()}（可用环境变量覆盖）")
+        except Exception:
+            pass
+    Tb_c = make_T(Rb_c, xyz_bc)  # base -> camera_body（假定）
+    # 若输入点云是 optical frame，则在外参后拼接标准旋转（camera_body->camera_optical）
+    # 约定：body (x前 y左 z上) -> optical (x右 y下 z前)
+    # 列向量为 body 基向量在 optical 下的坐标：
+    # e_x(body)=forward -> [0,0,1], e_y(body)=left -> [-1,0,0], e_z(body)=up -> [0,-1,0]
+    T_cbody_to_opt = None
+    if CAM_FRAME_IS_OPTICAL:
+        R_body_opt = np.array([[ 0.0, -1.0,  0.0],
+                               [ 0.0,  0.0, -1.0],
+                               [ 1.0,  0.0,  0.0]], dtype=np.float64)
+        T_cbody_to_opt = make_T(R_body_opt, np.zeros(3, dtype=np.float64))
+
+    # SDK 订阅
+    latest_state_lock = threading.Lock()
+    latest_state: Optional[RobotState] = None
+
+    def on_state_cb(st: RobotState):
+        nonlocal latest_state
+        with latest_state_lock:
+            latest_state = st
+
+    sdk = RobotSDKWrapper()
+    sdk.start(on_state_cb)
+
+    # 估计器
+    est = WorldEstimator()
+
+    # 如启用 ROS 点云或需要发布到 ROS，先初始化唯一的 ROS 节点（固定名，便于管理/清理）
+    if ROS_AVAILABLE and (USE_ROS_POINTCLOUD or PUBLISH_ROS_CLOUD):
+        if not rospy.core.is_initialized():
+            try:
+                rospy.init_node("world_base", anonymous=False, disable_signals=True)
+            except Exception:
+                pass
+
+    # 相机选择：优先 ROS 点云（若启用且可用）-> 其次 Realsense 直读（若未强制 ROS ONLY）
+    cam = None
+    if USE_ROS_POINTCLOUD and ROS_AVAILABLE:
+        try:
+            cam = RosPointCloudGrabber(ROS_POINTCLOUD_TOPIC)
+            print(f"[SoloFoot] ROS 点云订阅中: {ROS_POINTCLOUD_TOPIC}")
+        except Exception as e:
+            print(f"[SoloFoot] ROS 点云订阅失败: {e}")
+            cam = None
+    if cam is None and (not FORCE_ROS_ONLY):
+        if RS_AVAILABLE:
+            try:
+                cam = RealsenseGrabber(use_color=False)
+                print("[SoloFoot] Realsense 已启动")
+            except Exception as e:
+                print(f"[SoloFoot] Realsense 启动失败: {e}")
+                cam = None
+        else:
+            print("[SoloFoot] 无可用点云源（ROS/pyrealsense2），将仅输出位姿")
+
+    # 若需要在 RViz 中查看变换后的点云，则初始化 ROS 发布器
+    ros_cloud_pub = None
+    static_broadcaster = None
+    tf_broadcaster = None
+    ground_marker_pub = None
+    if PUBLISH_ROS_CLOUD and ROS_AVAILABLE:
+        try:
+            # 节点已在上方统一初始化
+            ros_cloud_pub = rospy.Publisher(ROS_CLOUD_TOPIC, PointCloud2, queue_size=1)
+            print(f"[SoloFoot] ROS 点云发布: topic={ROS_CLOUD_TOPIC}, frame={ROS_CLOUD_FRAME}")
+            # 可选：发布一个静态 TF，确保 RViz 中存在该 Fixed Frame（例如 odom）
+            if ENSURE_TF_STATIC and 'ROS_CLOUD_FRAME' in globals() and TF2_AVAILABLE:
+                try:
+                    static_broadcaster = tf2_ros.StaticTransformBroadcaster()
+                    t = TransformStamped()
+                    t.header.stamp = rospy.Time.now()
+                    t.header.frame_id = str(STATIC_PARENT_FRAME)
+                    t.child_frame_id = str(ROS_CLOUD_FRAME)
+                    t.transform.translation.x = 0.0
+                    t.transform.translation.y = 0.0
+                    t.transform.translation.z = 0.0
+                    t.transform.rotation.x = 0.0
+                    t.transform.rotation.y = 0.0
+                    t.transform.rotation.z = 0.0
+                    t.transform.rotation.w = 1.0
+                    static_broadcaster.sendTransform(t)
+                    print(f"[SoloFoot] 静态 TF 发布: {STATIC_PARENT_FRAME} -> {ROS_CLOUD_FRAME} (identity)")
+                except Exception:
+                    pass
+            # 可选：发布相机帧的动态 TF（ROS_CLOUD_FRAME -> CAMERA_FRAME_ID）
+            if PUBLISH_CAMERA_TF and TF2_AVAILABLE:
+                try:
+                    tf_broadcaster = tf2_ros.TransformBroadcaster()
+                    print(f"[SoloFoot] 动态 TF 启用: {ROS_CLOUD_FRAME} -> {CAMERA_FRAME_ID}")
+                except Exception:
+                    tf_broadcaster = None
+            # RViz 地平面 Marker 发布器
+            if PUBLISH_GROUND_MARKER:
+                try:
+                    ground_marker_pub = rospy.Publisher(GROUND_MARKER_TOPIC, Marker, queue_size=1)
+                    print(f"[SoloFoot] 地平面 Marker: topic={GROUND_MARKER_TOPIC}")
+                except Exception:
+                    ground_marker_pub = None
+        except Exception as e:
+            print(f"[SoloFoot] ROS 点云发布器创建失败: {e}")
+            ros_cloud_pub = None
+
+    try:
+        t_last_print = 0.0
+        last_cloud_ts_published = -1.0
+        last_pub_wall = 0.0
+        # 地平面健康检查周期（秒）；通过环境变量 PLANE_CHECK_SEC 控制，默认 0=关闭
+        plane_check_sec = float(os.environ.get("PLANE_CHECK_SEC", "0"))
+        last_plane_check = 0.0
+
+        # 准备可选的“相机世界位姿覆盖”
+        cam_world_T_override = None
+        if FORCE_CAMERA_IN_WORLD:
+            try:
+                # 位置
+                cxyz = _parse_vec_env("CAM_WORLD_XYZ", 3)
+                if cxyz is None and CAM_WORLD_XYZ_ENV:
+                    # 宽松解析兜底
+                    parts = [p.strip() for p in CAM_WORLD_XYZ_ENV.split(',') if p.strip()]
+                    if len(parts) == 3:
+                        cxyz = np.array([float(x) for x in parts], dtype=np.float64)
+                if cxyz is None:
+                    cxyz = np.array([0.0, 0.0, 1.0], dtype=np.float64)  # 默认相机离地 1m
+                # 姿态：优先 QUAT，再 RPY
+                cquat = _parse_vec_env("CAM_WORLD_QUAT", 4)
+                Rw_c = None
+                if (cquat is None) and CAM_WORLD_QUAT_ENV:
+                    parts = [p.strip() for p in CAM_WORLD_QUAT_ENV.split(',') if p.strip()]
+                    if len(parts) == 4:
+                        cquat = np.array([float(x) for x in parts], dtype=np.float64)
+                if cquat is not None:
+                    Rw_c = quat_to_rotmat(cquat)
+                else:
+                    crpy = None
+                    if CAM_WORLD_RPY_ENV:
+                        parts = [p.strip() for p in CAM_WORLD_RPY_ENV.split(',') if p.strip()]
+                        if len(parts) == 3:
+                            vals = [float(x) for x in parts]
+                            if CAM_WORLD_RPY_IS_DEG:
+                                vals = [math.radians(v) for v in vals]
+                            crpy = vals
+                    if crpy is None:
+                        # 默认“俯视”地面：roll=0, pitch=-90deg, yaw=0
+                        crpy = [0.0, -math.pi/2.0, 0.0]
+                    Rw_c = rpy_to_rotmat(crpy[0], crpy[1], crpy[2])
+                cam_world_T_override = make_T(Rw_c, cxyz)
+                print(f"[SoloFoot] FORCE_CAMERA_IN_WORLD 启用: xyz={cxyz.tolist()} (RPY/QUAT已应用)")
+            except Exception as e:
+                print(f"[SoloFoot] 相机世界位姿覆盖解析失败: {e}")
+                cam_world_T_override = None
+
+        while True:
+            # 读取最新状态
+            with latest_state_lock:
+                st = latest_state
+
+            if st is not None:
+                # IMU -> 姿态
+                if IMU_FROM_SDK:
+                    est.update_imu(st.imu_q)
+                else:
+                    est.update_imu(np.array([0,0,0,1], dtype=np.float64))
+                # 估计世界->基底
+                T_w_b = est.compute(st)
+            else:
+                # 尚未收到机器人状态，使用上一次（初始为单位）位姿
+                T_w_b = est.TW_b
+
+            # 点云处理
+            if cam is not None:
+                xyz_cam, ts = cam.get_points_xyz()
+                # 仅在收到新帧，且不超过发布频率上限时处理
+                wall_now = time.time()
+                allow_rate = (wall_now - last_pub_wall) >= (1.0 / max(1e-3, PUBLISH_MAX_HZ))
+                is_new = (ts > last_cloud_ts_published + 1e-6)
+                if xyz_cam.size > 0 and allow_rate and is_new:
+                    # 世界->相机
+                    if cam_world_T_override is not None:
+                        T_w_c = cam_world_T_override
+                        if T_cbody_to_opt is not None:
+                            T_w_c = T_w_c @ T_cbody_to_opt
+                    else:
+                        T_w_c = T_w_b @ Tb_c
+                        if T_cbody_to_opt is not None:
+                            T_w_c = T_w_c @ T_cbody_to_opt
+                    xyz_world = transform_points(T_w_c, xyz_cam).astype(np.float32, copy=False)
+
+                    # 可选：发布动态 TF（odom -> camera）
+                    if PUBLISH_CAMERA_TF and (tf_broadcaster is not None):
+                        try:
+                            t = TransformStamped()
+                            t.header.stamp = rospy.Time.now()
+                            t.header.frame_id = str(ROS_CLOUD_FRAME)
+                            t.child_frame_id = str(CAMERA_FRAME_ID)
+                            t.transform.translation.x = float(T_w_c[0, 3])
+                            t.transform.translation.y = float(T_w_c[1, 3])
+                            t.transform.translation.z = float(T_w_c[2, 3])
+                            q_cam = rotmat_to_quat(T_w_c[:3, :3])
+                            t.transform.rotation.x = float(q_cam[0])
+                            t.transform.rotation.y = float(q_cam[1])
+                            t.transform.rotation.z = float(q_cam[2])
+                            t.transform.rotation.w = float(q_cam[3])
+                            tf_broadcaster.sendTransform(t)
+                        except Exception:
+                            pass
+                    # 发布到 ROS，供 RViz 查看（Fixed Frame 设为 ROS_CLOUD_FRAME）
+                    if ros_cloud_pub is not None:
+                        try:
+                            header = Header()
+                            # 优先使用 ROS 时间
+                            header.stamp = rospy.Time.now() if ROS_AVAILABLE else None
+                            header.frame_id = ROS_CLOUD_FRAME
+                            # 转成 ROS 点云消息（为性能可在上游加入采样/体素）
+                            if ros_cloud_pub.get_num_connections() > 0:
+                                cloud_msg = pc2.create_cloud_xyz32(header, xyz_world.tolist())
+                                ros_cloud_pub.publish(cloud_msg)
+                                last_cloud_ts_published = ts
+                                last_pub_wall = wall_now
+                        except Exception:
+                            pass
+
+                    if SAVE_PLY:
+                        save_ply_xyz(PLY_PATH, xyz_world)
+
+                    # 周期性地对地面进行快速一致性检查（仅打印，不影响发布）
+                    if plane_check_sec > 0 and (wall_now - last_plane_check) >= plane_check_sec:
+                        last_plane_check = wall_now
+                        try:
+                            # 取地面候选：按 z 的 20% 分位以下
+                            z = xyz_world[:, 2]
+                            if z.size > 1000:
+                                zq = float(np.percentile(z, 20.0))
+                                mask = z <= zq
+                                sub = xyz_world[mask]
+                                # 限制数量，防止过重
+                                if sub.shape[0] > 50000:
+                                    idx = np.random.choice(sub.shape[0], 50000, replace=False)
+                                    sub = sub[idx]
+                                # 拟合平面
+                                n, d = fit_plane_pca(sub.astype(np.float64))
+                                # 与 +Z 的夹角
+                                tilt = math.degrees(math.acos(max(-1.0, min(1.0, float(n[2])))))
+                                # 平面在原点处的高度：解 n·x + d = 0，取 x=(0,0,z0) => z0 = -d / n_z
+                                z0 = (-d / max(1e-6, float(n[2])))
+                                # 统计 |z|<2cm 的比例
+                                pct2cm = float((np.abs(z) < 0.02).mean() * 100.0)
+                                print("[GroundCheck] tilt={:.2f}deg z0={:.1f}mm pct(|z|<2cm)={:.1f}%".format(
+                                    tilt, z0*1000.0, pct2cm))
+                                # 推送 RViz 平面 Marker（可视化验证）
+                                if ground_marker_pub is not None and ground_marker_pub.get_num_connections() > 0:
+                                    try:
+                                        mk = Marker()
+                                        mk.header.frame_id = ROS_CLOUD_FRAME
+                                        mk.header.stamp = rospy.Time.now()
+                                        mk.ns = "ground_plane"
+                                        mk.id = 0
+                                        mk.type = Marker.CUBE
+                                        mk.action = Marker.ADD
+                                        # 平面中心在 p = -d * n
+                                        p = (-d) * n
+                                        mk.pose.position.x = float(p[0])
+                                        mk.pose.position.y = float(p[1])
+                                        mk.pose.position.z = float(p[2])
+                                        # 旋转：将 +Z 旋到 n
+                                        z_axis = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+                                        c = float(np.dot(z_axis, n))
+                                        c = max(-1.0, min(1.0, c))
+                                        if c > 0.9999:
+                                            R = np.eye(3)
+                                        elif c < -0.9999:
+                                            # 180 度，从 Z 旋到 -Z，绕 X 轴即可
+                                            R = rot_matrix_from_axis_angle(np.array([1.0,0.0,0.0]), math.pi)
+                                        else:
+                                            axis = np.cross(z_axis, n)
+                                            axis_norm = np.linalg.norm(axis)
+                                            axis = axis / max(axis_norm, 1e-9)
+                                            ang = math.acos(c)
+                                            R = rot_matrix_from_axis_angle(axis, ang)
+                                        q = rotmat_to_quat(R)
+                                        mk.pose.orientation.x = float(q[0])
+                                        mk.pose.orientation.y = float(q[1])
+                                        mk.pose.orientation.z = float(q[2])
+                                        mk.pose.orientation.w = float(q[3])
+                                        # 尺寸：2m x 2m x 5mm，可按需放大
+                                        mk.scale.x = 2.0
+                                        mk.scale.y = 2.0
+                                        mk.scale.z = 0.005
+                                        mk.color.r = 0.0
+                                        mk.color.g = 1.0
+                                        mk.color.b = 0.2
+                                        mk.color.a = 0.35
+                                        mk.lifetime = rospy.Duration(2.0)
+                                        ground_marker_pub.publish(mk)
+                                    except Exception:
+                                        pass
+                        except Exception:
+                            pass
+
+            # 打印姿态与位置（限频，仅当收到机器人状态后）
+            now = time.time()
+            if st is not None and (now - t_last_print > 0.2):
+                t_last_print = now
+                p = est.pW_base
+                # 从 R 取 yaw/pitch/roll （Z-Y-X）
+                Rm = est.RW_b
+                yaw = math.atan2(Rm[1,0], Rm[0,0])
+                pitch = -math.asin(max(-1.0, min(1.0, Rm[2,0])))
+                roll = math.atan2(Rm[2,1], Rm[2,2])
+                print("[Pose] p=({:.3f},{:.3f},{:.3f}) rpy(deg)=({:.1f},{:.1f},{:.1f}) stance={}".format(
+                    p[0], p[1], p[2], math.degrees(roll), math.degrees(pitch), math.degrees(yaw),
+                    "L" if est.left_stance else "R"))
+
+            # 小睡以让出 CPU（整体延迟由 SDK/相机驱动决定）
+            time.sleep(max(0.0, LOOP_SLEEP_SEC))
+
+    except KeyboardInterrupt:
+        pass
+    finally:
+        sdk.stop()
+        if cam is not None:
+            cam.stop()
+        # 释放 ROS 发布与节点
+        try:
+            if 'ros_cloud_pub' in locals() and ros_cloud_pub is not None:
+                ros_cloud_pub.unregister()
+        except Exception:
+            pass
+        try:
+            if ROS_AVAILABLE:
+                rospy.signal_shutdown('world_base_done')
+                # 等待 Master 清理节点注册
+                time.sleep(0.2)
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    main()

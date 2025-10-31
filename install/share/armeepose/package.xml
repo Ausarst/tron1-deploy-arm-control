@@ -1,0 +1,29 @@
+<?xml version="1.0"?>
+<package format="2">
+    <!-- 基础信息 -->
+    <name>armeepose</name>
+    <version>0.1.0</version>
+    <description>Bridge node: subscribe /EEPose_cmd_rc and convert to Airbot SDK IK targets.</description>
+    <maintainer email="you@example.com">your-name</maintainer>
+    <license>Apache-2.0</license>
+
+    <!-- 构建工具依赖 -->
+    <buildtool_depend>catkin</buildtool_depend>
+
+    <!-- 运行时ROS依赖包 -->
+    <depend>roscpp</depend>
+    <depend>std_msgs</depend>
+    <depend>airbot_sdk</depend>
+
+    <!-- 系统库依赖 用于姿态计算（RPY → 四元数）-->
+    <build_depend>orocos-kdl</build_depend>
+    <build_export_depend>orocos-kdl</build_export_depend>
+    <exec_depend>orocos-kdl</exec_depend>
+
+    <!-- 矩阵运算库 -->
+    <build_depend>eigen</build_depend>
+    <build_export_depend>eigen</build_export_depend>
+    <exec_depend>eigen</exec_depend>
+
+    <export/>
+</package>

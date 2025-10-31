@@ -1,0 +1,8 @@
+prefix=/home/tong/limx_ws/devel
+
+Name: airbot_sdk
+Description: Description of airbot_sdk
+Version: 0.0.1
+Cflags: -I/home/tong/limx_ws/src/tron1-rl-deploy-ros/airbot-sdk-2.9/include
+Libs: -L${prefix}/lib 
+Requires: roscpp
