@@ -1,0 +1,8 @@
+<launch>
+  <param name="robot_description" command="cat $(find robot_description)/pointfoot/$(env ROBOT_TYPE)/urdf/robot.urdf"/>
+  <node name="robot_state_publisher" pkg="robot_state_publisher" type="robot_state_publisher" output="screen"/>
+  <!--node name="joint_state_publisher_gui" pkg="joint_state_publisher_gui" type="joint_state_publisher_gui" output="screen"/-->
+  <node name="rviz" pkg="rviz" type="rviz" output="screen"/>
+  <node pkg="tf2_ros" type="static_transform_publisher" name="camera_to_base"
+      args="0.13223 0.0222 -0.26826 0 1.063778179 0 base_Link camera0_link" />
+</launch>

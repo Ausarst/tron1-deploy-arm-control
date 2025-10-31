@@ -1,0 +1,15 @@
+<launch>
+  <node pkg="armeepose" type="arm_eepose_bridge" name="arm_eepose_bridge" output="screen">
+    <param name="urdf_path" value="/usr/share/airbot_models/airbot_play_with_gripper.urdf" />
+    <param name="can_interface" value="can0" />
+    <param name="direction" value="down" />
+    <param name="end_mode" value="gripper" />
+    <param name="bigarm_type" value="OD" />
+    <param name="forearm_type" value="DM" />
+    <param name="joint_vel_limit" value="3.14" />
+    <param name="use_planning" value="true" />
+    <param name="plan_vel" value="0.5" />
+    <param name="blocking" value="false" />
+    <param name="swap_rpy_like_controller" value="false" />
+  </node>
+</launch>

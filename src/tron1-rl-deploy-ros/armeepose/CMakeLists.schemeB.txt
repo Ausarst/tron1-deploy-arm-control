@@ -1,0 +1,48 @@
+cmake_minimum_required(VERSION 3.0.2)
+project(armeepose)
+
+add_compile_options(-std=c++14)
+
+find_package(catkin REQUIRED COMPONENTS
+  roscpp
+  std_msgs
+  orocos-kdl
+)
+
+# ========== 手动指定 Airbot SDK（方案 B） ==========
+# 根据你的实际安装位置修改这两个路径
+set(AIRBOT_INCLUDE_DIR "/opt/airbot-sdk-2.9/include" CACHE PATH "Airbot SDK include dir")
+set(AIRBOT_LIBRARY_DIR "/opt/airbot-sdk-2.9/lib" CACHE PATH "Airbot SDK library dir")
+
+# 库名可能是 libairbot.so 或 libairbot_sdk.so，二选一自动查找
+find_library(AIRBOT_LIBRARY
+  NAMES airbot airbot_sdk
+  PATHS ${AIRBOT_LIBRARY_DIR}
+  NO_DEFAULT_PATH
+)
+
+if(NOT AIRBOT_LIBRARY)
+  message(FATAL_ERROR "Airbot SDK library not found. Set AIRBOT_LIBRARY_DIR or AIRBOT_LIBRARY to the correct path.")
+endif()
+# ===============================================
+
+catkin_package()
+
+include_directories(
+  include
+  ${AIRBOT_INCLUDE_DIR}
+  ${catkin_INCLUDE_DIRS}
+)
+
+link_directories(${AIRBOT_LIBRARY_DIR})
+
+add_executable(arm_eepose_bridge src/ArmEeposeBridge.cpp)
+
+target_link_libraries(arm_eepose_bridge
+  ${catkin_LIBRARIES}
+  ${AIRBOT_LIBRARY}
+)
+
+install(TARGETS arm_eepose_bridge
+  RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+)
